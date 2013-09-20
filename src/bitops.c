@@ -32,6 +32,14 @@
 
 #define IS_16_BYTE_ALIGNED // hack in sdshdr right now :(
 
+#ifdef IS_16_BYTE_ALIGNED
+# define _simd_load_si128     _mm_load_si128
+# define _simd_store_si128    _mm_store_si128
+#else
+# define _simd_load_si128     _mm_loadu_si128
+# define _simd_store_si128    _mm_storeu_si128
+#endif
+
 /* -----------------------------------------------------------------------------
  * Helpers and low level bit functions.
  * -------------------------------------------------------------------------- */
@@ -287,26 +295,14 @@ void bitopCommand(redisClient *c) {
                 if (1 == useSIMD) {
                     _mm_empty();
                     while (minlen >= sizeof(__m128i)) {
-#ifdef IS_16_BYTE_ALIGNED
-                        __m128i xmm = _mm_load_si128(dst_ptr);
-#else
-                        __m128i xmm = _mm_loadu_si128(dst_ptr);
-#endif
+                        __m128i xmm = _simd_load_si128(dst_ptr);
                         for (i = 1; i < numkeys; i++) {
-#ifdef IS_16_BYTE_ALIGNED
-                            __m128i xmm1 = _mm_load_si128((__m128i *) avp[i]);
-#else
-                            __m128i xmm1 = _mm_loadu_si128((__m128i *) avp[i]);
-#endif
+                            __m128i xmm1 = _simd_load_si128((__m128i *) avp[i]);
                             xmm = _mm_and_si128(xmm, xmm1);
                             ++avp[i];
                         }
 
-#ifdef IS_16_BYTE_ALIGNED
-                        _mm_store_si128(dst_ptr++, xmm);
-#else
-                        _mm_storeu_si128(dst_ptr++, xmm);
-#endif
+                        _simd_store_si128(dst_ptr++, xmm);
 
                         j += sizeof(__m128i);
                         minlen -= sizeof(__m128i);
@@ -331,26 +327,14 @@ void bitopCommand(redisClient *c) {
                 if (1 == useSIMD) {
                     _mm_empty();
                     while (minlen >= sizeof(__m128i)) {
-#ifdef IS_16_BYTE_ALIGNED
-                        __m128i xmm = _mm_load_si128(dst_ptr);
-#else
-                        __m128i xmm = _mm_loadu_si128(dst_ptr);
-#endif
+                        __m128i xmm = _simd_load_si128(dst_ptr);
                         for (i = 1; i < numkeys; i++) {
-#ifdef IS_16_BYTE_ALIGNED
-                            __m128i xmm1 = _mm_load_si128((__m128i *) avp[i]);
-#else
-                            __m128i xmm1 = _mm_loadu_si128((__m128i *) avp[i]);
-#endif
+                            __m128i xmm1 = _simd_load_si128((__m128i *) avp[i]);
                             xmm = _mm_or_si128(xmm, xmm1);
                             ++avp[i];
                         }
 
-#ifdef IS_16_BYTE_ALIGNED
-                        _mm_store_si128(dst_ptr++, xmm);
-#else
-                        _mm_storeu_si128(dst_ptr++, xmm);
-#endif
+                        _simd_store_si128(dst_ptr++, xmm);
 
                         j += sizeof(__m128i);
                         minlen -= sizeof(__m128i);
@@ -375,26 +359,14 @@ void bitopCommand(redisClient *c) {
                 if (1 == useSIMD) {
                     _mm_empty();
                     while (minlen >= sizeof(__m128i)) {
-#ifdef IS_16_BYTE_ALIGNED
-                        __m128i xmm = _mm_load_si128(dst_ptr);
-#else
-                        __m128i xmm = _mm_loadu_si128(dst_ptr);
-#endif
+                        __m128i xmm = _simd_load_si128(dst_ptr);
                         for (i = 1; i < numkeys; i++) {
-#ifdef IS_16_BYTE_ALIGNED
-                            __m128i xmm1 = _mm_load_si128((__m128i *) avp[i]);
-#else
-                            __m128i xmm1 = _mm_loadu_si128((__m128i *) avp[i]);
-#endif
+                            __m128i xmm1 = _simd_load_si128((__m128i *) avp[i]);
                             xmm = _mm_xor_si128(xmm, xmm1);
                             ++avp[i];
                         }
 
-#ifdef IS_16_BYTE_ALIGNED
-                        _mm_store_si128(dst_ptr++, xmm);
-#else
-                        _mm_storeu_si128(dst_ptr++, xmm);
-#endif
+                        _simd_store_si128(dst_ptr++, xmm);
 
                         j += sizeof(__m128i);
                         minlen -= sizeof(__m128i);
