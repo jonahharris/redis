@@ -30,6 +30,8 @@
 
 #include "redis.h"
 
+#define IS_16_BYTE_ALIGNED // hack in sdshdr right now :(
+
 /* -----------------------------------------------------------------------------
  * Helpers and low level bit functions.
  * -------------------------------------------------------------------------- */
@@ -251,7 +253,11 @@ void bitopCommand(redisClient *c) {
 
     /* Compute the bit operation, if at least one string is not empty. */
     if (maxlen) {
+
+        // This would be much better if we could align at 16 byte offsets
         res = (unsigned char*) sdsnewlen(NULL,maxlen);
+
+        unsigned int useSIMD = 0;
         unsigned char output, byte;
         long i;
 
@@ -263,49 +269,151 @@ void bitopCommand(redisClient *c) {
             unsigned long *lp[16];
             unsigned long *lres = (unsigned long*) res;
 
+            __m128i *dst_ptr = (__m128i *) res;
+            __m128i *avp[16];
+
+            memcpy(res, src[0], minlen);
+
             /* Note: sds pointer is always aligned to 8 byte boundary. */
-            memcpy(lp,src,sizeof(unsigned long*)*numkeys);
-            memcpy(res,src[0],minlen);
+            if (2 == numkeys) {
+                memcpy(lp, src, (sizeof(unsigned long *) * numkeys));
+            } else {
+                useSIMD = 1;
+                memcpy(avp, src, (sizeof(__m128i *) * numkeys));
+            }
 
             /* Different branches per different operations for speed (sorry). */
             if (op == BITOP_AND) {
-                while(minlen >= sizeof(unsigned long)*4) {
-                    for (i = 1; i < numkeys; i++) {
-                        lres[0] &= lp[i][0];
-                        lres[1] &= lp[i][1];
-                        lres[2] &= lp[i][2];
-                        lres[3] &= lp[i][3];
-                        lp[i]+=4;
+                if (1 == useSIMD) {
+                    _mm_empty();
+                    while (minlen >= sizeof(__m128i)) {
+#ifdef IS_16_BYTE_ALIGNED
+                        __m128i xmm = _mm_load_si128(dst_ptr);
+#else
+                        __m128i xmm = _mm_loadu_si128(dst_ptr);
+#endif
+                        for (i = 1; i < numkeys; i++) {
+#ifdef IS_16_BYTE_ALIGNED
+                            __m128i xmm1 = _mm_load_si128((__m128i *) avp[i]);
+#else
+                            __m128i xmm1 = _mm_loadu_si128((__m128i *) avp[i]);
+#endif
+                            xmm = _mm_and_si128(xmm, xmm1);
+                            ++avp[i];
+                        }
+
+#ifdef IS_16_BYTE_ALIGNED
+                        _mm_store_si128(dst_ptr++, xmm);
+#else
+                        _mm_storeu_si128(dst_ptr++, xmm);
+#endif
+
+                        j += sizeof(__m128i);
+                        minlen -= sizeof(__m128i);
                     }
-                    lres+=4;
-                    j += sizeof(unsigned long)*4;
-                    minlen -= sizeof(unsigned long)*4;
+                }
+                else
+                {
+                    while(minlen >= sizeof(unsigned long)*4) {
+                        for (i = 1; i < numkeys; i++) {
+                            lres[0] &= lp[i][0];
+                            lres[1] &= lp[i][1];
+                            lres[2] &= lp[i][2];
+                            lres[3] &= lp[i][3];
+                            lp[i]+=4;
+                        }
+                        lres+=4;
+                        j += sizeof(unsigned long)*4;
+                        minlen -= sizeof(unsigned long)*4;
+                    }
                 }
             } else if (op == BITOP_OR) {
-                while(minlen >= sizeof(unsigned long)*4) {
-                    for (i = 1; i < numkeys; i++) {
-                        lres[0] |= lp[i][0];
-                        lres[1] |= lp[i][1];
-                        lres[2] |= lp[i][2];
-                        lres[3] |= lp[i][3];
-                        lp[i]+=4;
+                if (1 == useSIMD) {
+                    _mm_empty();
+                    while (minlen >= sizeof(__m128i)) {
+#ifdef IS_16_BYTE_ALIGNED
+                        __m128i xmm = _mm_load_si128(dst_ptr);
+#else
+                        __m128i xmm = _mm_loadu_si128(dst_ptr);
+#endif
+                        for (i = 1; i < numkeys; i++) {
+#ifdef IS_16_BYTE_ALIGNED
+                            __m128i xmm1 = _mm_load_si128((__m128i *) avp[i]);
+#else
+                            __m128i xmm1 = _mm_loadu_si128((__m128i *) avp[i]);
+#endif
+                            xmm = _mm_or_si128(xmm, xmm1);
+                            ++avp[i];
+                        }
+
+#ifdef IS_16_BYTE_ALIGNED
+                        _mm_store_si128(dst_ptr++, xmm);
+#else
+                        _mm_storeu_si128(dst_ptr++, xmm);
+#endif
+
+                        j += sizeof(__m128i);
+                        minlen -= sizeof(__m128i);
                     }
-                    lres+=4;
-                    j += sizeof(unsigned long)*4;
-                    minlen -= sizeof(unsigned long)*4;
+                }
+                else
+                {
+                    while(minlen >= sizeof(unsigned long)*4) {
+                        for (i = 1; i < numkeys; i++) {
+                            lres[0] |= lp[i][0];
+                            lres[1] |= lp[i][1];
+                            lres[2] |= lp[i][2];
+                            lres[3] |= lp[i][3];
+                            lp[i]+=4;
+                        }
+                        lres+=4;
+                        j += sizeof(unsigned long)*4;
+                        minlen -= sizeof(unsigned long)*4;
+                    }
                 }
             } else if (op == BITOP_XOR) {
-                while(minlen >= sizeof(unsigned long)*4) {
-                    for (i = 1; i < numkeys; i++) {
-                        lres[0] ^= lp[i][0];
-                        lres[1] ^= lp[i][1];
-                        lres[2] ^= lp[i][2];
-                        lres[3] ^= lp[i][3];
-                        lp[i]+=4;
+                if (1 == useSIMD) {
+                    _mm_empty();
+                    while (minlen >= sizeof(__m128i)) {
+#ifdef IS_16_BYTE_ALIGNED
+                        __m128i xmm = _mm_load_si128(dst_ptr);
+#else
+                        __m128i xmm = _mm_loadu_si128(dst_ptr);
+#endif
+                        for (i = 1; i < numkeys; i++) {
+#ifdef IS_16_BYTE_ALIGNED
+                            __m128i xmm1 = _mm_load_si128((__m128i *) avp[i]);
+#else
+                            __m128i xmm1 = _mm_loadu_si128((__m128i *) avp[i]);
+#endif
+                            xmm = _mm_xor_si128(xmm, xmm1);
+                            ++avp[i];
+                        }
+
+#ifdef IS_16_BYTE_ALIGNED
+                        _mm_store_si128(dst_ptr++, xmm);
+#else
+                        _mm_storeu_si128(dst_ptr++, xmm);
+#endif
+
+                        j += sizeof(__m128i);
+                        minlen -= sizeof(__m128i);
                     }
-                    lres+=4;
-                    j += sizeof(unsigned long)*4;
-                    minlen -= sizeof(unsigned long)*4;
+                }
+                else
+                {
+                    while(minlen >= sizeof(unsigned long)*4) {
+                        for (i = 1; i < numkeys; i++) {
+                            lres[0] ^= lp[i][0];
+                            lres[1] ^= lp[i][1];
+                            lres[2] ^= lp[i][2];
+                            lres[3] ^= lp[i][3];
+                            lp[i]+=4;
+                        }
+                        lres+=4;
+                        j += sizeof(unsigned long)*4;
+                        minlen -= sizeof(unsigned long)*4;
+                    }
                 }
             } else if (op == BITOP_NOT) {
                 while(minlen >= sizeof(unsigned long)*4) {
