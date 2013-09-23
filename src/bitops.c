@@ -40,6 +40,84 @@
 # define _simd_store_si128    _mm_storeu_si128
 #endif
 
+#ifndef __forceinline
+# define __forceinline __attribute__((always_inline))
+#endif
+
+__forceinline void *
+simd_memcpy (void *s1, const void *s2, size_t n)
+{
+  char *ps1 = (char *) s1;
+  char *ps2 = (char *) s2;
+
+  uint32_t bytesToBoundary = ((16 - ((uintptr_t) ps2 & 15)) & 15);
+  uint32_t ii = bytesToBoundary;
+  uint32_t nOn16;
+
+  if (n < 16 || ((uintptr_t) s2 & 15) != ((uintptr_t) s1 & 15)) {
+    return memcpy(s1, s2, n);
+  }
+
+  for (; ii > 0; --ii) {
+    *ps1++ = *ps2++;
+  }
+
+  n -= bytesToBoundary;
+  nOn16 = (n & 0x70);
+
+  __m128i r0, r1, r2, r3, r4, r5, r6, r7;
+  for (ii = (n >> 7); ii > 0; --ii) {
+    _mm_prefetch(ps2 + 512, _MM_HINT_NTA);
+    _mm_prefetch(ps2 + 512 + 64, _MM_HINT_NTA);
+    r0 = _mm_load_si128((__m128i *)(ps2));
+    r1 = _mm_load_si128((__m128i *)(ps2 + 16));
+    r2 = _mm_load_si128((__m128i *)(ps2 + 32));
+    r3 = _mm_load_si128((__m128i *)(ps2 + 48));
+    r4 = _mm_load_si128((__m128i *)(ps2 + 64));
+    r5 = _mm_load_si128((__m128i *)(ps2 + 80));
+    r6 = _mm_load_si128((__m128i *)(ps2 + 96));
+    r7 = _mm_load_si128((__m128i *)(ps2 + 112));
+    _mm_stream_si128((__m128i *)(ps1), r0);
+    _mm_stream_si128((__m128i *)(ps1 + 16), r1);
+    _mm_stream_si128((__m128i *)(ps1 + 32), r2);
+    _mm_stream_si128((__m128i *)(ps1 + 48), r3);
+    _mm_stream_si128((__m128i *)(ps1 + 64), r4);
+    _mm_stream_si128((__m128i *)(ps1 + 80), r5);
+    _mm_stream_si128((__m128i *)(ps1 + 96), r6);
+    _mm_stream_si128((__m128i *)(ps1 + 112), r7);
+    ps2 += 128;
+    ps1 += 128;
+  }
+
+  switch (nOn16 >> 4) {
+    case 7: r7 = _mm_load_si128((__m128i *)(ps2 + 96));
+    case 6: r6 = _mm_load_si128((__m128i *)(ps2 + 80));
+    case 5: r5 = _mm_load_si128((__m128i *)(ps2 + 64));
+    case 4: r4 = _mm_load_si128((__m128i *)(ps2 + 48));
+    case 3: r3 = _mm_load_si128((__m128i *)(ps2 + 32));
+    case 2: r2 = _mm_load_si128((__m128i *)(ps2 + 16));
+    case 1: r1 = _mm_load_si128((__m128i *)(ps2));
+  }
+  switch (nOn16 >> 4) {
+    case 7: _mm_stream_si128((__m128i *)(ps1 + 96), r7);
+    case 6: _mm_stream_si128((__m128i *)(ps1 + 80), r6);
+    case 5: _mm_stream_si128((__m128i *)(ps1 + 64), r5);
+    case 4: _mm_stream_si128((__m128i *)(ps1 + 48), r4);
+    case 3: _mm_stream_si128((__m128i *)(ps1 + 32), r3);
+    case 2: _mm_stream_si128((__m128i *)(ps1 + 16), r2);
+    case 1: _mm_stream_si128((__m128i *)(ps1), r1);
+  }
+
+  ps2 += nOn16;
+  ps1 += nOn16;
+
+  for (ii = (n & 15); ii > 0; --ii) {
+    *ps1++ = *ps2++;
+  }
+
+  return s1;
+}
+
 /* -----------------------------------------------------------------------------
  * Helpers and low level bit functions.
  * -------------------------------------------------------------------------- */
@@ -280,8 +358,6 @@ void bitopCommand(redisClient *c) {
             __m128i *dst_ptr = (__m128i *) res;
             __m128i *avp[16];
 
-            memcpy(res, src[0], minlen);
-
             /* Note: sds pointer is always aligned to 8 byte boundary. */
             if (2 == numkeys) {
                 memcpy(lp, src, (sizeof(unsigned long *) * numkeys));
@@ -290,11 +366,17 @@ void bitopCommand(redisClient *c) {
                 memcpy(avp, src, (sizeof(__m128i *) * numkeys));
             }
 
+            simd_memcpy(res, src[0], minlen);
+
             /* Different branches per different operations for speed (sorry). */
             if (op == BITOP_AND) {
                 if (1 == useSIMD) {
                     _mm_empty();
                     while (minlen >= sizeof(__m128i)) {
+                        /*
+                         * As expected, it's faster to do a memcpy and load
+                         * from res than it is to do a simd load from src[0].
+                         */
                         __m128i xmm = _simd_load_si128(dst_ptr);
                         for (i = 1; i < numkeys; i++) {
                             __m128i xmm1 = _simd_load_si128((__m128i *) avp[i]);
