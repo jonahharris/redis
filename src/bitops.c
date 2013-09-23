@@ -30,6 +30,94 @@
 
 #include "redis.h"
 
+#define IS_16_BYTE_ALIGNED // hack in sdshdr right now :(
+
+#ifdef IS_16_BYTE_ALIGNED
+# define _simd_load_si128     _mm_load_si128
+# define _simd_store_si128    _mm_store_si128
+#else
+# define _simd_load_si128     _mm_loadu_si128
+# define _simd_store_si128    _mm_storeu_si128
+#endif
+
+#ifndef __forceinline
+# define __forceinline __attribute__((always_inline))
+#endif
+
+__forceinline void *
+simd_memcpy (void *s1, const void *s2, size_t n)
+{
+  char *ps1 = (char *) s1;
+  char *ps2 = (char *) s2;
+
+  uint32_t bytesToBoundary = ((16 - ((uintptr_t) ps2 & 15)) & 15);
+  uint32_t ii = bytesToBoundary;
+  uint32_t nOn16;
+
+  if (n < 16 || ((uintptr_t) s2 & 15) != ((uintptr_t) s1 & 15)) {
+    return memcpy(s1, s2, n);
+  }
+
+  for (; ii > 0; --ii) {
+    *ps1++ = *ps2++;
+  }
+
+  n -= bytesToBoundary;
+  nOn16 = (n & 0x70);
+
+  __m128i r0, r1, r2, r3, r4, r5, r6, r7;
+  for (ii = (n >> 7); ii > 0; --ii) {
+    _mm_prefetch(ps2 + 512, _MM_HINT_NTA);
+    _mm_prefetch(ps2 + 512 + 64, _MM_HINT_NTA);
+    r0 = _mm_load_si128((__m128i *)(ps2));
+    r1 = _mm_load_si128((__m128i *)(ps2 + 16));
+    r2 = _mm_load_si128((__m128i *)(ps2 + 32));
+    r3 = _mm_load_si128((__m128i *)(ps2 + 48));
+    r4 = _mm_load_si128((__m128i *)(ps2 + 64));
+    r5 = _mm_load_si128((__m128i *)(ps2 + 80));
+    r6 = _mm_load_si128((__m128i *)(ps2 + 96));
+    r7 = _mm_load_si128((__m128i *)(ps2 + 112));
+    _mm_stream_si128((__m128i *)(ps1), r0);
+    _mm_stream_si128((__m128i *)(ps1 + 16), r1);
+    _mm_stream_si128((__m128i *)(ps1 + 32), r2);
+    _mm_stream_si128((__m128i *)(ps1 + 48), r3);
+    _mm_stream_si128((__m128i *)(ps1 + 64), r4);
+    _mm_stream_si128((__m128i *)(ps1 + 80), r5);
+    _mm_stream_si128((__m128i *)(ps1 + 96), r6);
+    _mm_stream_si128((__m128i *)(ps1 + 112), r7);
+    ps2 += 128;
+    ps1 += 128;
+  }
+
+  switch (nOn16 >> 4) {
+    case 7: r7 = _mm_load_si128((__m128i *)(ps2 + 96));
+    case 6: r6 = _mm_load_si128((__m128i *)(ps2 + 80));
+    case 5: r5 = _mm_load_si128((__m128i *)(ps2 + 64));
+    case 4: r4 = _mm_load_si128((__m128i *)(ps2 + 48));
+    case 3: r3 = _mm_load_si128((__m128i *)(ps2 + 32));
+    case 2: r2 = _mm_load_si128((__m128i *)(ps2 + 16));
+    case 1: r1 = _mm_load_si128((__m128i *)(ps2));
+  }
+  switch (nOn16 >> 4) {
+    case 7: _mm_stream_si128((__m128i *)(ps1 + 96), r7);
+    case 6: _mm_stream_si128((__m128i *)(ps1 + 80), r6);
+    case 5: _mm_stream_si128((__m128i *)(ps1 + 64), r5);
+    case 4: _mm_stream_si128((__m128i *)(ps1 + 48), r4);
+    case 3: _mm_stream_si128((__m128i *)(ps1 + 32), r3);
+    case 2: _mm_stream_si128((__m128i *)(ps1 + 16), r2);
+    case 1: _mm_stream_si128((__m128i *)(ps1), r1);
+  }
+
+  ps2 += nOn16;
+  ps1 += nOn16;
+
+  for (ii = (n & 15); ii > 0; --ii) {
+    *ps1++ = *ps2++;
+  }
+
+  return s1;
+}
+
 /* -----------------------------------------------------------------------------
  * Helpers and low level bit functions.
  * -------------------------------------------------------------------------- */
@@ -250,7 +338,11 @@ void bitopCommand(redisClient *c) {
 
     /* Compute the bit operation, if at least one string is not empty. */
     if (maxlen) {
+
+        // This would be much better if we could align at 16 byte offsets
         res = (unsigned char*) sdsnewlen(NULL,maxlen);
+
+        unsigned int useSIMD = 0;
         unsigned char output, byte;
         long i;
 
@@ -262,49 +354,119 @@ void bitopCommand(redisClient *c) {
             unsigned long *lp[16];
             unsigned long *lres = (unsigned long*) res;
 
+            __m128i *dst_ptr = (__m128i *) res;
+            __m128i *avp[16];
+
             /* Note: sds pointer is always aligned to 8 byte boundary. */
-            memcpy(lp,src,sizeof(unsigned long*)*numkeys);
-            memcpy(res,src[0],minlen);
+            if (2 == numkeys) {
+                memcpy(lp, src, (sizeof(unsigned long *) * numkeys));
+            } else {
+                useSIMD = 1;
+                memcpy(avp, src, (sizeof(__m128i *) * numkeys));
+            }
+
+            simd_memcpy(res, src[0], minlen);
 
             /* Different branches per different operations for speed (sorry). */
             if (op == BITOP_AND) {
-                while(minlen >= sizeof(unsigned long)*4) {
-                    for (i = 1; i < numkeys; i++) {
-                        lres[0] &= lp[i][0];
-                        lres[1] &= lp[i][1];
-                        lres[2] &= lp[i][2];
-                        lres[3] &= lp[i][3];
-                        lp[i]+=4;
+                if (1 == useSIMD) {
+                    _mm_empty();
+                    while (minlen >= sizeof(__m128i)) {
+                        /*
+                         * As expected, it's faster to do a memcpy and load
+                         * from res than it is to do a simd load from src[0].
+                         */
+                        __m128i xmm = _simd_load_si128(dst_ptr);
+                        for (i = 1; i < numkeys; i++) {
+                            __m128i xmm1 = _simd_load_si128((__m128i *) avp[i]);
+                            xmm = _mm_and_si128(xmm, xmm1);
+                            ++avp[i];
+                        }
+
+                        _simd_store_si128(dst_ptr++, xmm);
+
+                        j += sizeof(__m128i);
+                        minlen -= sizeof(__m128i);
                     }
-                    lres+=4;
-                    j += sizeof(unsigned long)*4;
-                    minlen -= sizeof(unsigned long)*4;
+                }
+                else
+                {
+                    while(minlen >= sizeof(unsigned long)*4) {
+                        for (i = 1; i < numkeys; i++) {
+                            lres[0] &= lp[i][0];
+                            lres[1] &= lp[i][1];
+                            lres[2] &= lp[i][2];
+                            lres[3] &= lp[i][3];
+                            lp[i]+=4;
+                        }
+                        lres+=4;
+                        j += sizeof(unsigned long)*4;
+                        minlen -= sizeof(unsigned long)*4;
+                    }
                 }
             } else if (op == BITOP_OR) {
-                while(minlen >= sizeof(unsigned long)*4) {
-                    for (i = 1; i < numkeys; i++) {
-                        lres[0] |= lp[i][0];
-                        lres[1] |= lp[i][1];
-                        lres[2] |= lp[i][2];
-                        lres[3] |= lp[i][3];
-                        lp[i]+=4;
+                if (1 == useSIMD) {
+                    _mm_empty();
+                    while (minlen >= sizeof(__m128i)) {
+                        __m128i xmm = _simd_load_si128(dst_ptr);
+                        for (i = 1; i < numkeys; i++) {
+                            __m128i xmm1 = _simd_load_si128((__m128i *) avp[i]);
+                            xmm = _mm_or_si128(xmm, xmm1);
+                            ++avp[i];
+                        }
+
+                        _simd_store_si128(dst_ptr++, xmm);
+
+                        j += sizeof(__m128i);
+                        minlen -= sizeof(__m128i);
                     }
-                    lres+=4;
-                    j += sizeof(unsigned long)*4;
-                    minlen -= sizeof(unsigned long)*4;
+                }
+                else
+                {
+                    while(minlen >= sizeof(unsigned long)*4) {
+                        for (i = 1; i < numkeys; i++) {
+                            lres[0] |= lp[i][0];
+                            lres[1] |= lp[i][1];
+                            lres[2] |= lp[i][2];
+                            lres[3] |= lp[i][3];
+                            lp[i]+=4;
+                        }
+                        lres+=4;
+                        j += sizeof(unsigned long)*4;
+                        minlen -= sizeof(unsigned long)*4;
+                    }
                 }
             } else if (op == BITOP_XOR) {
-                while(minlen >= sizeof(unsigned long)*4) {
-                    for (i = 1; i < numkeys; i++) {
-                        lres[0] ^= lp[i][0];
-                        lres[1] ^= lp[i][1];
-                        lres[2] ^= lp[i][2];
-                        lres[3] ^= lp[i][3];
-                        lp[i]+=4;
+                if (1 == useSIMD) {
+                    _mm_empty();
+                    while (minlen >= sizeof(__m128i)) {
+                        __m128i xmm = _simd_load_si128(dst_ptr);
+                        for (i = 1; i < numkeys; i++) {
+                            __m128i xmm1 = _simd_load_si128((__m128i *) avp[i]);
+                            xmm = _mm_xor_si128(xmm, xmm1);
+                            ++avp[i];
+                        }
+
+                        _simd_store_si128(dst_ptr++, xmm);
+
+                        j += sizeof(__m128i);
+                        minlen -= sizeof(__m128i);
                     }
-                    lres+=4;
-                    j += sizeof(unsigned long)*4;
-                    minlen -= sizeof(unsigned long)*4;
+                }
+                else
+                {
+                    while(minlen >= sizeof(unsigned long)*4) {
+                        for (i = 1; i < numkeys; i++) {
+                            lres[0] ^= lp[i][0];
+                            lres[1] ^= lp[i][1];
+                            lres[2] ^= lp[i][2];
+                            lres[3] ^= lp[i][3];
+                            lp[i]+=4;
+                        }
+                        lres+=4;
+                        j += sizeof(unsigned long)*4;
+                        minlen -= sizeof(unsigned long)*4;
+                    }
                 }
             } else if (op == BITOP_NOT) {
                 while(minlen >= sizeof(unsigned long)*4) {
@@ -407,3 +569,91 @@ void bitcountCommand(redisClient *c) {
         addReplyLongLong(c,popcount(p+start,bytes));
     }
 }
+
+/* BITPOS key [start end limit] */
+void bitposCommand(redisClient *c) {
+    robj *o;
+    long start, end, limit = -1, strlen;
+    void *replylen = NULL;
+    unsigned char *p, byte;
+    char llbuf[32];
+    unsigned long bytecount = 0;
+    unsigned long bitcount = 0;
+
+    /* Lookup, check for type, and return 0 for non existing keys. */
+    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.emptymultibulk)) == NULL ||
+        checkType(c,o,REDIS_STRING)) return;
+
+    /* Set the 'p' pointer to the string, that can be just a stack allocated
+     * array if our string was integer encoded. */
+    if (o->encoding == REDIS_ENCODING_INT) {
+        p = (unsigned char*) llbuf;
+        strlen = ll2string(llbuf,sizeof(llbuf),(long)o->ptr);
+    } else {
+        p = (unsigned char*) o->ptr;
+        strlen = sdslen(o->ptr);
+    }
+
+    /* Parse start/end range if any. */
+    if (c->argc == 5) {
+        if (getLongFromObjectOrReply(c,c->argv[4],&limit,NULL) != REDIS_OK)
+            return;
+    }
+    if (c->argc >= 4) {
+        if (getLongFromObjectOrReply(c,c->argv[2],&start,NULL) != REDIS_OK)
+            return;
+        if (getLongFromObjectOrReply(c,c->argv[3],&end,NULL) != REDIS_OK)
+            return;
+    } else if (c->argc == 3) {
+        if (getLongFromObjectOrReply(c,c->argv[2],&start,NULL) != REDIS_OK)
+            return;
+        end = strlen-1;
+    } else if (c->argc == 2) {
+        /* The whole string. */
+        start = 0;
+        end = strlen-1;
+    } else {
+        /* Syntax error. */
+        addReply(c,shared.syntaxerr);
+        return;
+    }
+
+    /* Convert negative indexes */
+    if (start < 0) start = strlen+start;
+    if (end < 0) end = strlen+end;
+    if (start < 0) start = 0;
+    if (end < 0) end = 0;
+    if (end >= strlen) end = strlen-1;
+
+    /* Precondition: end >= 0 && end < strlen, so the only condition where
+     * zero can be returned is: start > end. */
+    if (start > end) {
+        addReply(c,shared.emptymultibulk);
+        return;
+    }
+
+    p = (p + start);
+    bytecount = (end - start + 1);
+    replylen = addDeferredMultiBulkLength(c);
+
+    /* iterate over bytes */
+    while (bytecount--) {
+        unsigned int i = 128, pos = 0;
+        byte = *p++;
+        while (byte && limit) {
+            if (byte & i) {
+                addReplyBulkLongLong(c, (start * 8 + pos));
+                byte &= ~(1 << (7 - pos));
+                ++bitcount;
+                --limit;
+                limit = (((-1) > (limit)) ? (-1) : (limit));
+            }
+            i >>= 1;
+            pos++;
+        }
+        start++;
+    }
+
+    setDeferredMultiBulkLength(c, replylen, bitcount);
+}
+

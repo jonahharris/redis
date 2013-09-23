@@ -50,6 +50,8 @@
 #include <netinet/in.h>
 #include <lua.h>
 #include <signal.h>
+#include <emmintrin.h>
+#include <xmmintrin.h>
 
 #include "ae.h"      /* Event driven programming library */
 #include "sds.h"     /* Dynamic safe strings */
@@ -1201,6 +1203,7 @@ void scriptCommand(redisClient *c);
 void timeCommand(redisClient *c);
 void bitopCommand(redisClient *c);
 void bitcountCommand(redisClient *c);
+void bitposCommand(redisClient *c);
 void replconfCommand(redisClient *c);
 
 #if defined(__GNUC__)

@@ -14,11 +14,11 @@
 
 release_hdr := $(shell sh -c './mkreleasehdr.sh')
 uname_S := $(shell sh -c 'uname -s 2>/dev/null || echo not')
-OPTIMIZATION?=-O2
+OPTIMIZATION?=-O3
 DEPENDENCY_TARGETS=hiredis linenoise lua
 
 # Default settings
-STD= -std=c99 -pedantic
+STD= -std=c99 -pedantic -msse2
 WARN= -Wall
 OPT= $(OPTIMIZATION)
 
